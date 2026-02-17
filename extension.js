@@ -1,13 +1,14 @@
 (function (Scratch) {
   'use strict';
 
+  // サンドボックス外実行のチェック
   if (!Scratch.extensions.unsandboxed) {
-    throw new Error('HyperLink Realtime requires unsandboxed mode');
+    throw new Error('HyperLink v1 requires unsandboxed mode');
   }
 
   const runtime = Scratch.vm.runtime;
 
-  class HyperLinkV39 {
+  class HyperLinkV1 {
     constructor() {
       this.apiRegistry = {};   
       this.dataStorage = {};   
@@ -17,7 +18,7 @@
       this.connectedState = {}; 
       this.manualDisconnect = {}; 
       this.sendQueues = {};
-      this.errorModes = {}; // 1: 自動再接続, 2: ハット対応
+      this.errorModes = {}; 
 
       // 物理的重複発火を阻止するイベントキュー
       this.eventQueues = {
@@ -30,8 +31,8 @@
 
     getInfo() {
       return {
-        id: 'hyperLinkV39',
-        name: 'HyperLink Realtime: 究極V39',
+        id: 'hyperlinkV1',
+        name: 'HyperLink v1', // 名前をリクエスト通りに設定
         color1: '#0080ff',
         blocks: [
           {
@@ -115,7 +116,7 @@
       };
     }
 
-    // --- ハットブロック：エッジトリガー判定 ---
+    // --- エッジトリガー判定 ---
     _checkEvent(opcode, label) {
       if (this.eventQueues[opcode].has(label)) {
         this.eventQueues[opcode].delete(label);
@@ -133,7 +134,7 @@
       runtime.requestRedraw();
     }
 
-    // --- 通信コアロジック ---
+    // --- メインロジック ---
     connectAndRegister(args) {
       this.apiRegistry[args.LABEL] = args.URL;
       this.manualDisconnect[args.LABEL] = false;
@@ -173,8 +174,8 @@
       do {
         try {
           const sep = url.includes('?') ? '&' : '?';
-          const fastUrl = `${url}${sep}_t=${Date.now()}`;
-          const res = await fetch(fastUrl, { cache: 'no-store' });
+          // 8分遅延破壊クエリ
+          const res = await fetch(`${url}${sep}_t=${Date.now()}`, { cache: 'no-store' });
           if (!res.ok) throw new Error();
           const text = await res.text();
 
@@ -262,5 +263,5 @@
     }
   }
 
-  Scratch.extensions.register(new HyperLinkV39());
+  Scratch.extensions.register(new HyperLinkV1());
 })(Scratch);

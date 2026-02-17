@@ -2,12 +2,12 @@
   'use strict';
 
   if (!Scratch.extensions.unsandboxed) {
-    throw new Error('HyperLink Realtime vβ0.5 must run unsandboxed');
+    throw new Error('HyperLink Realtime requires unsandboxed mode');
   }
 
   const runtime = Scratch.vm.runtime;
 
-  class HyperLinkRealtime {
+  class HyperLinkV39 {
     constructor() {
       this.apiRegistry = {};   
       this.dataStorage = {};   
@@ -16,20 +16,22 @@
       this.lastData = {};      
       this.connectedState = {}; 
       this.manualDisconnect = {}; 
-      this.sendQueues = {}; 
+      this.sendQueues = {};
+      this.errorModes = {}; // 1: 自動再接続, 2: ハット対応
 
-      // 物理的重複発火を阻止するエッジトリガーキュー
+      // 物理的重複発火を阻止するイベントキュー
       this.eventQueues = {
         onConnected: new Set(),
         onMessageReceived: new Set(),
-        onDisconnected: new Set()
+        onDisconnected: new Set(),
+        onError: new Set()
       };
     }
 
     getInfo() {
       return {
-        id: 'hyperLinkRealtimeV05',
-        name: 'HyperLink Realtime vβ0.5',
+        id: 'hyperLinkV39',
+        name: 'HyperLink Realtime: 究極V39',
         color1: '#0080ff',
         blocks: [
           {
@@ -42,6 +44,12 @@
             opcode: 'onMessageReceived',
             blockType: Scratch.BlockType.HAT,
             text: 'ラベル [LABEL] で情報/応答が届いたとき',
+            arguments: { LABEL: { type: Scratch.ArgumentType.STRING, defaultValue: 'API_1' } }
+          },
+          {
+            opcode: 'onError',
+            blockType: Scratch.BlockType.HAT,
+            text: 'ラベル [LABEL] で接続Errorが起きたとき',
             arguments: { LABEL: { type: Scratch.ArgumentType.STRING, defaultValue: 'API_1' } }
           },
           {
@@ -63,16 +71,25 @@
           {
             opcode: 'setModeAndRun',
             blockType: Scratch.BlockType.COMMAND,
-            text: 'ラベル [LABEL] を [MODE] モードへ強制変換',
+            text: 'ラベル [LABEL] を [MODE] モードへ変換',
             arguments: {
               LABEL: { type: Scratch.ArgumentType.STRING, defaultValue: 'API_1' },
               MODE: { type: Scratch.ArgumentType.STRING, menu: 'modeMenu', defaultValue: '自動変換' }
             }
           },
           {
+            opcode: 'setErrorMode',
+            blockType: Scratch.BlockType.COMMAND,
+            text: 'ラベル [LABEL] のError処理を [ERROR_MODE] にする',
+            arguments: {
+              LABEL: { type: Scratch.ArgumentType.STRING, defaultValue: 'API_1' },
+              ERROR_MODE: { type: Scratch.ArgumentType.STRING, menu: 'errorModeMenu', defaultValue: '1. 自動再接続' }
+            }
+          },
+          {
             opcode: 'sendToLabel',
             blockType: Scratch.BlockType.COMMAND,
-            text: 'ラベル [LABEL] にメッセージ [MSG] を送信 (接続待ち対応)',
+            text: 'ラベル [LABEL] にメッセージ [MSG] を送信',
             arguments: {
               LABEL: { type: Scratch.ArgumentType.STRING, defaultValue: 'API_1' },
               MSG: { type: Scratch.ArgumentType.STRING, defaultValue: '' }
@@ -92,11 +109,13 @@
           }
         ],
         menus: {
-          modeMenu: { acceptReporters: true, items: ['自動変換', '常時接続', '直出力'] }
+          modeMenu: { acceptReporters: true, items: ['自動変換', '常時接続', '直出力'] },
+          errorModeMenu: { items: ['1. 自動再接続', '2. ハットでの対応'] }
         }
       };
     }
 
+    // --- ハットブロック：エッジトリガー判定 ---
     _checkEvent(opcode, label) {
       if (this.eventQueues[opcode].has(label)) {
         this.eventQueues[opcode].delete(label);
@@ -106,6 +125,7 @@
     }
     onConnected(args) { return this._checkEvent('onConnected', args.LABEL); }
     onMessageReceived(args) { return this._checkEvent('onMessageReceived', args.LABEL); }
+    onError(args) { return this._checkEvent('onError', args.LABEL); }
     onDisconnected(args) { return this._checkEvent('onDisconnected', args.LABEL); }
 
     _emit(opcode, label) {
@@ -113,34 +133,51 @@
       runtime.requestRedraw();
     }
 
+    // --- 通信コアロジック ---
     connectAndRegister(args) {
       this.apiRegistry[args.LABEL] = args.URL;
-      this.setModeAndRun({ LABEL: args.LABEL, MODE: '自動変換' });
+      this.manualDisconnect[args.LABEL] = false;
+      if (!this.errorModes[args.LABEL]) this.errorModes[args.LABEL] = '1. 自動再接続';
+      this._startConnection(args.LABEL, args.URL, '自動変換');
     }
 
     setModeAndRun(args) {
       const url = this.apiRegistry[args.LABEL];
-      if (!url) return;
-      this.manualDisconnect[args.LABEL] = false;
-      
-      this.isLooping[args.LABEL] = false;
-      if (this.sockets[args.LABEL]) {
-        this.sockets[args.LABEL].onclose = null;
-        this.sockets[args.LABEL].close();
-        delete this.sockets[args.LABEL];
-      }
-      this.connectedState[args.LABEL] = false;
+      if (url) this._startConnection(args.LABEL, url, args.MODE);
+    }
 
-      const isWs = (args.MODE === '自動変換') ? url.startsWith('ws') : (args.MODE === '常時接続');
-      if (isWs) this._setupWS(args.LABEL, url); else { this.isLooping[args.LABEL] = true; this._httpLoop(args.LABEL, url, args.MODE === '直出力'); }
+    setErrorMode(args) {
+      this.errorModes[args.LABEL] = args.ERROR_MODE;
+    }
+
+    _startConnection(label, url, mode) {
+      this.isLooping[label] = false;
+      if (this.sockets[label]) {
+        this.sockets[label].onclose = null;
+        this.sockets[label].close();
+        delete this.sockets[label];
+      }
+      this.connectedState[label] = false;
+
+      const isWs = (mode === '自動変換') ? url.startsWith('ws') : (mode === '常時接続');
+
+      if (isWs) {
+        this._setupWS(label, url);
+      } else {
+        this.isLooping[label] = true;
+        this._httpLoop(label, url, mode === '直出力');
+      }
     }
 
     async _httpLoop(label, url, once) {
       do {
         try {
           const sep = url.includes('?') ? '&' : '?';
-          const res = await fetch(`${url}${sep}_t=${Date.now()}`, { cache: 'no-store' });
+          const fastUrl = `${url}${sep}_t=${Date.now()}`;
+          const res = await fetch(fastUrl, { cache: 'no-store' });
+          if (!res.ok) throw new Error();
           const text = await res.text();
+
           if (!this.connectedState[label]) {
             this.connectedState[label] = true;
             this._emit('onConnected', label);
@@ -151,14 +188,16 @@
             this._emit('onMessageReceived', label);
           }
         } catch (e) {
+          this._emit('onError', label);
           if (this.connectedState[label]) {
             this.connectedState[label] = false;
             this._emit('onDisconnected', label);
           }
-          if (!this.manualDisconnect[label] && !once) {
-            await new Promise(r => setTimeout(r, 3000));
-            continue;
+          if (this.errorModes[label] === '2. ハットでの対応') {
+            this.isLooping[label] = false;
+            break;
           }
+          if (!once) await new Promise(r => setTimeout(r, 3000));
         }
         if (once) break;
         await new Promise(r => setTimeout(r, 2000));
@@ -174,7 +213,7 @@
         this.connectedState[label] = true;
         this._emit('onConnected', label);
         if (this.sendQueues[label]) {
-          this.sendQueues[label].forEach(msg => ws.send(msg));
+          this.sendQueues[label].forEach(m => ws.send(m));
           this.sendQueues[label] = [];
         }
       };
@@ -183,26 +222,26 @@
         this.lastData[label] = e.data;
         this._emit('onMessageReceived', label);
       };
+      ws.onerror = () => {
+        this._emit('onError', label);
+      };
       ws.onclose = () => {
         if (this.connectedState[label]) {
           this.connectedState[label] = false;
           this._emit('onDisconnected', label);
         }
-        if (!this.manualDisconnect[label]) setTimeout(() => this._setupWS(label, url), 3000);
+        if (!this.manualDisconnect[label] && this.errorModes[label] === '1. 自動再接続') {
+          setTimeout(() => { if (this.apiRegistry[label]) this._setupWS(label, url); }, 3000);
+        }
       };
-      ws.onerror = () => ws.close();
     }
 
     sendToLabel(args) {
-      const label = args.LABEL;
-      const msg = args.MSG || "";
-      const ws = this.sockets[label];
-
-      if (ws && ws.readyState === 1) {
-        ws.send(msg);
-      } else {
-        if (!this.sendQueues[label]) this.sendQueues[label] = [];
-        this.sendQueues[label].push(msg);
+      const ws = this.sockets[args.LABEL];
+      if (ws && ws.readyState === 1) ws.send(args.MSG || "");
+      else {
+        if (!this.sendQueues[args.LABEL]) this.sendQueues[args.LABEL] = [];
+        this.sendQueues[args.LABEL].push(args.MSG || "");
       }
     }
 
@@ -223,5 +262,5 @@
     }
   }
 
-  Scratch.extensions.register(new HyperLinkRealtime());
+  Scratch.extensions.register(new HyperLinkV39());
 })(Scratch);
